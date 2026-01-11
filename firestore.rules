@@ -1,0 +1,220 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // ============================================================
+    // HELPER FUNCTIONS
+    // ============================================================
+    
+    // Check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Get current user ID
+    function userId() {
+      return request.auth.uid;
+    }
+    
+    // Check if user is a member of the workspace
+    function isWorkspaceMember(workspaceId) {
+      return isAuthenticated() && 
+        exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(userId()));
+    }
+    
+    // Get user's role in workspace
+    function getMemberRole(workspaceId) {
+      return get(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(userId())).data.role;
+    }
+    
+    // Check if user is workspace owner
+    function isWorkspaceOwner(workspaceId) {
+      return isWorkspaceMember(workspaceId) && getMemberRole(workspaceId) == 'owner';
+    }
+    
+    // Check if user is workspace admin or owner
+    function isWorkspaceAdmin(workspaceId) {
+      return isWorkspaceMember(workspaceId) && 
+        (getMemberRole(workspaceId) == 'owner' || getMemberRole(workspaceId) == 'admin');
+    }
+    
+    // Check if user can edit (owner, admin, or member - not viewer)
+    function canEdit(workspaceId) {
+      return isWorkspaceMember(workspaceId) && getMemberRole(workspaceId) != 'viewer';
+    }
+    
+    // Validate transaction data
+    function isValidTransaction() {
+      let data = request.resource.data;
+      return data.type in ['income', 'expense'] &&
+        data.amount is number && data.amount > 0 &&
+        data.categoryId is string &&
+        data.description is string &&
+        data.date is timestamp;
+    }
+    
+    // Validate category data
+    function isValidCategory() {
+      let data = request.resource.data;
+      return data.type in ['income', 'expense'] &&
+        data.group in ['fixed', 'variable'] &&
+        data.label is string && data.label.size() > 0 &&
+        data.color is string &&
+        data.icon is string;
+    }
+    
+    // ============================================================
+    // USER DOCUMENTS
+    // ============================================================
+    
+    match /users/{uid} {
+      // Users can only read/write their own document
+      allow read: if isAuthenticated() && userId() == uid;
+      allow create: if isAuthenticated() && userId() == uid;
+      allow update: if isAuthenticated() && userId() == uid;
+      allow delete: if false; // Users cannot delete their own document
+    }
+    
+    // ============================================================
+    // WORKSPACES
+    // ============================================================
+    
+    match /workspaces/{workspaceId} {
+      // Members can read workspace
+      allow read: if isWorkspaceMember(workspaceId);
+      
+      // Only authenticated users can create workspaces (they become owner)
+      allow create: if isAuthenticated() && 
+        request.resource.data.ownerId == userId();
+      
+      // Only admins and owners can update workspace settings
+      allow update: if isWorkspaceAdmin(workspaceId) &&
+        // Cannot change owner
+        request.resource.data.ownerId == resource.data.ownerId;
+      
+      // Only owner can delete workspace
+      allow delete: if isWorkspaceOwner(workspaceId);
+      
+      // ============================================================
+      // WORKSPACE MEMBERS
+      // ============================================================
+      
+      match /members/{memberId} {
+        // Members can read other members
+        allow read: if isWorkspaceMember(workspaceId);
+        
+        // Owner creates first member (themselves) during workspace creation
+        // Admins can add new members
+        allow create: if isAuthenticated() && (
+          // Owner adding themselves during creation
+          (memberId == userId() && request.resource.data.role == 'owner') ||
+          // Admin adding new member
+          isWorkspaceAdmin(workspaceId)
+        );
+        
+        // Admins can update member roles (except owner)
+        allow update: if isWorkspaceAdmin(workspaceId) &&
+          // Cannot change owner's role
+          (resource.data.role != 'owner' || request.resource.data.role == 'owner');
+        
+        // Admins can remove members (except owner)
+        // Members can remove themselves
+        allow delete: if isWorkspaceMember(workspaceId) && (
+          memberId == userId() || // Self-removal
+          (isWorkspaceAdmin(workspaceId) && resource.data.role != 'owner') // Admin removing non-owner
+        );
+      }
+      
+      // ============================================================
+      // CATEGORIES
+      // ============================================================
+      
+      match /categories/{categoryId} {
+        // Members can read categories
+        allow read: if isWorkspaceMember(workspaceId);
+        
+        // Members with edit permission can create categories
+        allow create: if canEdit(workspaceId) && isValidCategory();
+        
+        // Members with edit permission can update categories
+        allow update: if canEdit(workspaceId) && isValidCategory();
+        
+        // Only admins can delete categories
+        allow delete: if isWorkspaceAdmin(workspaceId);
+      }
+      
+      // ============================================================
+      // TRANSACTIONS
+      // ============================================================
+      
+      match /transactions/{transactionId} {
+        // Members can read all transactions in the workspace
+        allow read: if isWorkspaceMember(workspaceId);
+        
+        // Members with edit permission can create transactions
+        allow create: if canEdit(workspaceId) && 
+          isValidTransaction() &&
+          request.resource.data.createdBy == userId();
+        
+        // Members with edit permission can update transactions
+        allow update: if canEdit(workspaceId) && 
+          isValidTransaction() &&
+          // Cannot change createdBy
+          request.resource.data.createdBy == resource.data.createdBy;
+        
+        // Members with edit permission can delete their own transactions
+        // Admins can delete any transaction
+        allow delete: if canEdit(workspaceId) && (
+          resource.data.createdBy == userId() ||
+          isWorkspaceAdmin(workspaceId)
+        );
+      }
+      
+      // ============================================================
+      // RECURRING TRANSACTIONS (for future use)
+      // ============================================================
+      
+      match /recurring/{recurringId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create: if canEdit(workspaceId);
+        allow update: if canEdit(workspaceId);
+        allow delete: if canEdit(workspaceId);
+      }
+      
+      // ============================================================
+      // BUDGETS (for future use)
+      // ============================================================
+      
+      match /budgets/{budgetId} {
+        allow read: if isWorkspaceMember(workspaceId);
+        allow create: if canEdit(workspaceId);
+        allow update: if canEdit(workspaceId);
+        allow delete: if isWorkspaceAdmin(workspaceId);
+      }
+    }
+    
+    // ============================================================
+    // INVITATIONS (for future use)
+    // ============================================================
+    
+    match /invitations/{invitationId} {
+      // Anyone can read invitation by ID (for accepting)
+      allow read: if true;
+      
+      // Workspace admins can create invitations
+      allow create: if isWorkspaceAdmin(request.resource.data.workspaceId);
+      
+      // Workspace admins can update/cancel invitations
+      allow update: if isWorkspaceAdmin(resource.data.workspaceId);
+      allow delete: if isWorkspaceAdmin(resource.data.workspaceId);
+    }
+    
+    // ============================================================
+    // DENY ALL OTHER ACCESS
+    // ============================================================
+    
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
